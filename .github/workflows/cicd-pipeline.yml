@@ -1,0 +1,157 @@
+# This workflow will build a .NET project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-net
+
+name: CICD - Pipeline
+permissions:
+  contents: read
+  issues: read
+  checks: write
+  pull-requests: write
+on:
+  push:
+    branches: [ "main","release/**/*" ]
+  pull_request:
+    branches: [ "main","release/*" ]
+env:
+  solutionPath: '${{ github.workspace }}/src/DiscordNerfWatcher.Solution/DiscordNerfWatcher.Solution.sln'
+  solutionFolder: '${{ github.workspace }}/src/DiscordNerfWatcher.Solution'
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+  
+    steps:
+    - uses: actions/checkout@v3
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: 7.0.x
+    - name: Restore dependencies
+      run: dotnet restore ${{  env.solutionPath  }}
+    - name: Build
+      run: dotnet build ${{  env.solutionPath  }} --configuration Release --no-restore
+    - name: Execute unit tests
+      run: dotnet test ${{  env.solutionPath  }} --configuration Release --no-build --logger trx --no-restore --filter FullyQualifiedName!~IntegrationTests --results-directory "TestResults" --collect:"XPlat Code Coverage"
+    - name: Publish Test Report
+      uses: phoenix-actions/test-reporting@v8
+      id: test-report               # Set ID reference for step
+      if: ${{ (success() || failure()) && (github.event_name == 'pull_request')   }}     # run this step even if previous step failed
+      with:
+        name: unit tests            # Name of the check run which will be created
+        path: TestResults/*.trx    # Path to test results
+        reporter: dotnet-trx       # Format of test results
+    - name: Code Coverage Report
+      uses: irongut/CodeCoverageSummary@v1.3.0
+      if: github.event_name == 'pull_request'
+      with:
+        filename: TestResults/*/coverage.cobertura.xml
+        badge: true
+        fail_below_min: true
+        format: markdown
+        hide_branch_rate: false
+        hide_complexity: true
+        indicators: true
+        output: both
+        thresholds: '60 50'
+    - name: Add Coverage PR Comment
+      uses: marocchino/sticky-pull-request-comment@v2
+      if: github.event_name == 'pull_request'
+      with:
+        recreate: true
+        path: code-coverage-results.md
+      
+    - name: ReportGenerator
+      uses: danielpalme/ReportGenerator-GitHub-Action@5.2.0
+      if: github.event_name == 'pull_request'
+      with:
+        reports: TestResults/*/coverage.cobertura.xml # REQUIRED # The coverage reports that should be parsed (separated by semicolon). Globbing is supported.
+        targetdir: 'coveragereport' # REQUIRED # The directory where the generated report should be saved.
+        reporttypes: 'HtmlInline;Cobertura' # The output formats and scope (separated by semicolon) Values: Badges, Clover, Cobertura, OpenCover, CsvSummary, Html, Html_Dark, Html_Light, Html_BlueRed, HtmlChart, HtmlInline, HtmlInline_AzurePipelines, HtmlInline_AzurePipelines_Dark, HtmlInline_AzurePipelines_Light, HtmlSummary, Html_BlueRed_Summary, JsonSummary, Latex, LatexSummary, lcov, MarkdownSummary, MarkdownSummaryGithub, MarkdownDeltaSummary, MHtml, SvgChart, SonarQube, TeamCitySummary, TextSummary, TextDeltaSummary, Xml, XmlSummary
+        tag: '${{ github.run_number }}_${{ github.run_id }}' # Optional tag or build version.
+        toolpath: 'reportgeneratortool' # Default directory for installing the dotnet tool.
+
+    - name: Upload coverage report artifact
+      uses: actions/upload-artifact@v2.2.3
+      if: github.event_name == 'pull_request'
+      with:
+        name: CoverageReport # Artifact name        
+        path: coveragereport # Directory containing files to upload
+
+   # - name: Publish Database artifact#
+    #  uses: actions/upload-artifact@v2.2.3#
+    #  if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' }}#
+    #  with:#
+      #  name: Database # Artifact name    #    
+     #   path: ${{  env.solutionFolder  }}/DiscordNerfWatcher.Database/**/* # Directory containing files to upload#
+
+  deployProduction:
+    name: Deploy in Production
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release') && github.event_name != 'pull_request' }}
+    steps:
+        - uses: actions/checkout@v3
+        - name: Setup .NET
+          uses: actions/setup-dotnet@v3
+          with:
+            dotnet-version: 7.0.x
+        - name: 'Login via Azure CLI'
+          uses: azure/login@v1
+          with:
+            creds: ${{ secrets.AZURE_CREDENTIALS }}
+        - name: Restore dependencies
+          run: dotnet restore ${{  env.solutionPath  }}
+        - name: Build
+          run: dotnet build ${{  env.solutionPath  }} --configuration Release --no-restore
+    
+        - name: Replace tokens
+          uses: cschleiden/replace-tokens@v1
+          with:
+            tokenPrefix: '${'
+            tokenSuffix: '}$'
+            files: '["**/*.json"]'
+          env:
+            database_hostname: ${{ vars.DATABASE_HOSTNAME }}
+            database_username: ${{ vars.DATABASE_USER  }}
+            database_name: ${{ vars.DATABASE_NAME }}
+            DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
+            DiscordBotToken: ${{ secrets.DiscordBotToken }}
+        
+        - name: 'Connect to Container Registry'
+          uses: azure/docker-login@v1
+          with:
+            login-server: ${{ secrets.REGISTRY_LOGIN_SERVER }}
+            username: ${{ secrets.REGISTRY_USERNAME }}
+            password: ${{ secrets.REGISTRY_PASSWORD }}
+        - name: 'Build and push docker image'
+          run: |
+            cd ${{ env.solutionFolder }}
+            docker build -f 'DiscordNerfWatcher.Bot/Dockerfile' -t ${{ secrets.REGISTRY_LOGIN_SERVER }}/dnwbot:${{ github.sha }} .
+            docker push ${{ secrets.REGISTRY_LOGIN_SERVER }}/dnwbot:${{ github.sha }}
+
+        - name: Update database
+          run: |
+            cd ${{ env.solutionFolder }}/DiscordNerfWatcher.Database
+            dotnet tool install --global dotnet-ef --version 7.0.*
+            dotnet ef database update --no-build --configuration Release
+          env:
+            ASPNETCORE_ENVIRONMENT: Production
+
+        - name: 'Deploy to Azure Container Instances'
+          uses: 'azure/aci-deploy@v1'
+          with:
+            resource-group: ${{ secrets.RESOURCE_GROUP }}
+            dns-name-label: ${{ secrets.RESOURCE_GROUP }}${{ github.run_number }}
+            image: ${{ secrets.REGISTRY_LOGIN_SERVER }}/dnwbot:${{ github.sha }}
+            registry-login-server: ${{ secrets.REGISTRY_LOGIN_SERVER }}
+            registry-username: ${{ secrets.REGISTRY_USERNAME }}
+            registry-password: ${{ secrets.REGISTRY_PASSWORD }}
+            name: aci-dnwbot
+            location: 'east us'
+
+
+      
+  
+    
+  
